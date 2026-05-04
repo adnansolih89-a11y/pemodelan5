@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from bertopic import BERTopic
 from sentence_transformers import SentenceTransformer
+from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report
 from transformers import pipeline
 from datetime import datetime
@@ -17,6 +18,29 @@ import os
 import time
 
 st.set_page_config(page_title="Dynamic Topic Modeling & Stance Analysis", layout="wide")
+
+# Indonesian text normalization support
+try:
+    from Sastrawi.Stemmer.StemmerFactory import StemmerFactory
+    from Sastrawi.StopWordRemover.StopWordRemoverFactory import StopWordRemoverFactory
+    _sastrawi_available = True
+    _stemmer = StemmerFactory().create_stemmer()
+    _stopwords_set = set(StopWordRemoverFactory().get_stop_words())
+except ImportError:
+    _sastrawi_available = False
+    _stemmer = None
+    _stopwords_set = set()
+    logging.warning("Sastrawi tidak tersedia. Preprocessing akan berjalan tanpa stemming dan stopword removal Bahasa Indonesia.")
+
+SLANG_NORMALIZATION = {
+    'yg': 'yang', 'dg': 'dengan', 'dgn': 'dengan', 'dr': 'dari', 'gk': 'tidak',
+    'ga': 'tidak', 'gak': 'tidak', 'tdk': 'tidak', 'td': 'tidak', 'ttg': 'tentang',
+    'jgn': 'jangan', 'wkwk': 'haha', 'hahaha': 'haha', 'klo': 'kalau', 'klu': 'kalau',
+    'kpn': 'kapan', 'krn': 'karena', 'sbg': 'sebagai', 'skt': 'sakit', 'sy': 'saya',
+    'kmu': 'kamu', 'km': 'kamu', 'tp': 'tetapi', 'tapi': 'tetapi', 'udh': 'sudah',
+    'jd': 'jadi', 'ads': 'ada', 'udh': 'sudah', 'blm': 'belum', 'pls': 'tolong',
+    'bgt': 'banget', 'smoga': 'semoga', 'tp': 'tetapi', 'mks': 'makasih', 'thx': 'terima kasih'
+}
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -273,11 +297,13 @@ def preprocess_text(text):
     1. Konversi ke string dan lowercase
     2. Hapus URL
     3. Hapus mention (@username)
-    4. Hapus hashtag (#topic)
-    5. Hapus emoji
+    4. Normalisasi hashtag
+    5. Hapus emoji dan karakter non-alphanumeric
     6. Hapus angka
-    7. Hapus punctuation dan special characters
-    8. Hapus extra whitespace
+    7. Normalisasi slang
+    8. Hapus stopwords Bahasa Indonesia
+    9. Stemming Bahasa Indonesia
+    10. Hapus extra whitespace
     
     Args:
         text: Input text
@@ -286,36 +312,35 @@ def preprocess_text(text):
         Preprocessed text
     """
     logging.info(f"Starting preprocess_text for text length: {len(str(text))}")
-    if pd.isna(text):
+    if pd.isna(text) or not str(text).strip():
         logging.info("Completed preprocess_text: empty text")
         return ""
-    
-    text = str(text)
-    
-    # 1. Lowercase
-    text = text.lower()
-    
-    # 2. Hapus URL (http://... atau https://...)
+
+    text = str(text).lower()
     text = re.sub(r'http\S+|www\S+|https\S+', '', text, flags=re.MULTILINE)
-    
-    # 3. Hapus mention (@username)
     text = re.sub(r'@\w+', '', text)
-    
-    # 4. Hapus hashtag (#topic) - hanya hapus simbol #, tapi keep kata
     text = re.sub(r'#(\w+)', r'\1', text)
-    
-    # 5. Hapus emoji dan special Unicode characters
-    text = text.encode('ascii', 'ignore').decode('ascii')
-    
-    # 6. Hapus angka
+
+    # Remove emojis and non-standard symbols
+    text = re.sub(r'[^ -]+', ' ', text)
     text = re.sub(r'\d+', '', text)
-    
-    # 7. Hapus punctuation dan special characters (keep hanya alphanumeric dan space)
-    text = re.sub(r'[^\w\s]', '', text)
-    
-    # 8. Hapus multiple spaces dan leading/trailing whitespace
+    text = re.sub(r'[^\w\s]', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
-    
+
+    tokens = [token for token in text.split() if token]
+    tokens = [SLANG_NORMALIZATION.get(token, token) for token in tokens]
+
+    if _stopwords_set:
+        tokens = [token for token in tokens if token not in _stopwords_set]
+
+    text = ' '.join(tokens)
+    if _stemmer is not None and text:
+        try:
+            text = _stemmer.stem(text)
+        except Exception as e:
+            logging.warning(f"Stemming gagal: {e}")
+
+    text = re.sub(r'\s+', ' ', text).strip()
     logging.info(f"Completed preprocess_text: output length: {len(text)}")
     return text
 
@@ -833,7 +858,14 @@ if uploaded_file:
                 status_text.text("🔄 Tahap 1/4: Inisialisasi Model...")
                 progress_bar.progress(0.25)
                 logging.info("Initializing BERTopic model")
-                topic_model = BERTopic(embedding_model=embedding_model)
+                vectorizer_model = CountVectorizer(ngram_range=(1, 2), min_df=5, max_df=0.5)
+                topic_model = BERTopic(
+                    embedding_model=embedding_model,
+                    vectorizer_model=vectorizer_model,
+                    language="indonesian",
+                    nr_topics=30,
+                    calculate_probabilities=False
+                )
                 
                 # Store model in session state immediately
                 st.session_state['topic_model'] = topic_model
